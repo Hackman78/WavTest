@@ -1,12 +1,12 @@
 use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{implement, IUnknown, Interface, Result, GUID, HRESULT, PCWSTR, PROPVARIANT};
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_TIMEOUT};
@@ -28,6 +28,7 @@ use windows::Win32::System::Threading::{
 
 const REFTIMES_PER_SEC: i64 = 10_000_000;
 const ACTIVATION_TIMEOUT_MS: u32 = 5000;
+const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 // IAudioClient IID
 const AUDIO_CLIENT_IID: GUID = GUID::from_u128(0x1cb9ad4c_dbfa_4c32_b178_c2f568a703b2);
@@ -249,18 +250,14 @@ struct WavFormat {
     block_align: u16,
 }
 
-/// Write PCM audio data to a WAV file
-fn write_wav_file(filename: &str, format: &WavFormat, data: &[u8]) -> std::io::Result<()> {
-    let file = File::create(filename)?;
-    let mut writer = BufWriter::new(file);
-
-    let data_size = data.len() as u32;
+/// Write a WAV header with placeholder zeros for the two size fields.
+/// The caller must seek back and fix offsets 4 and 40 when done.
+fn write_wav_header_placeholder(writer: &mut BufWriter<File>, format: &WavFormat) -> std::io::Result<()> {
     let fmt_chunk_size: u32 = 16;
-    let file_size = 4 + (8 + fmt_chunk_size) + (8 + data_size);
 
     // RIFF header
     writer.write_all(b"RIFF")?;
-    writer.write_all(&file_size.to_le_bytes())?;
+    writer.write_all(&0u32.to_le_bytes())?; // offset 4: RIFF chunk size — fixed at end
     writer.write_all(b"WAVE")?;
 
     // fmt chunk
@@ -273,10 +270,9 @@ fn write_wav_file(filename: &str, format: &WavFormat, data: &[u8]) -> std::io::R
     writer.write_all(&format.block_align.to_le_bytes())?;
     writer.write_all(&format.bits_per_sample.to_le_bytes())?;
 
-    // data chunk
+    // data chunk header
     writer.write_all(b"data")?;
-    writer.write_all(&data_size.to_le_bytes())?;
-    writer.write_all(data)?;
+    writer.write_all(&0u32.to_le_bytes())?; // offset 40: data chunk size — fixed at end
 
     writer.flush()?;
     Ok(())
@@ -389,12 +385,33 @@ fn capture_audio(pid: u32, output_file: &str, running: Arc<AtomicBool>) -> Resul
         let sleep_duration_ms = (buffer_frame_count as u64 * 500 / n_samples_per_sec as u64).max(5);
         let sleep_duration = Duration::from_millis(sleep_duration_ms);
 
+        // Open output file and write placeholder WAV header immediately
+        let wav_format = WavFormat {
+            channels: n_channels,
+            sample_rate: n_samples_per_sec,
+            bits_per_sample: 16,
+            bytes_per_sec: n_samples_per_sec * n_channels as u32 * 2,
+            block_align: n_channels * 2,
+        };
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(output_file)
+            .map_err(|e| windows::core::Error::new(E_FAIL, format!("Failed to open file: {}", e)))?;
+
+        let mut writer = BufWriter::new(file);
+
+        write_wav_header_placeholder(&mut writer, &wav_format)
+            .map_err(|e| windows::core::Error::new(E_FAIL, format!("Failed to write header: {}", e)))?;
+
         // Start capture
         audio_client.Start()?;
 
-        // Capture loop
-        let mut audio_data: Vec<u8> = Vec::new();
+        let mut bytes_written: u64 = 0;
         let bytes_per_frame = n_block_align as usize;
+        let mut last_flush = Instant::now();
 
         while running.load(Ordering::SeqCst) {
             let mut packet_length = match capture_client.GetNextPacketSize() {
@@ -417,11 +434,27 @@ fn capture_audio(pid: u32, output_file: &str, running: Arc<AtomicBool>) -> Resul
                 if num_frames > 0 {
                     let data_size = num_frames as usize * bytes_per_frame;
 
-                    if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                        audio_data.resize(audio_data.len() + data_size, 0);
+                    let raw_chunk: &[u8] = if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                        // WASAPI says treat as silence — write zeroed bytes
+                        &vec![0u8; data_size]
                     } else if !data_ptr.is_null() {
-                        let slice = std::slice::from_raw_parts(data_ptr, data_size);
-                        audio_data.extend_from_slice(slice);
+                        std::slice::from_raw_parts(data_ptr, data_size)
+                    } else {
+                        &[]
+                    };
+
+                    if !raw_chunk.is_empty() {
+                        let pcm = if is_float {
+                            convert_float_to_pcm16(raw_chunk)
+                        } else {
+                            raw_chunk.to_vec()
+                        };
+
+                        writer.write_all(&pcm).map_err(|e| {
+                            windows::core::Error::new(E_FAIL, format!("Write failed: {}", e))
+                        })?;
+
+                        bytes_written += pcm.len() as u64;
                     }
                 }
 
@@ -433,35 +466,49 @@ fn capture_audio(pid: u32, output_file: &str, running: Arc<AtomicBool>) -> Resul
                 };
             }
 
+            // Flush BufWriter to OS every second so the file is usable for clip copies
+            if last_flush.elapsed() >= FLUSH_INTERVAL {
+                let _ = writer.flush();
+                last_flush = Instant::now();
+            }
+
             thread::sleep(sleep_duration);
         }
 
         // Stop capture
         let _ = audio_client.Stop();
 
-        // Don't write empty files
-        if audio_data.is_empty() {
+        // Nothing captured — delete the stub file and exit cleanly
+        if bytes_written == 0 {
+            drop(writer);
+            let _ = std::fs::remove_file(output_file);
             return Ok(());
         }
 
-        // Convert float to PCM16 if needed
-        let final_data = if is_float {
-            convert_float_to_pcm16(&audio_data)
-        } else {
-            audio_data
-        };
+        // Flush remaining buffer and get the underlying file back for seeking
+        let mut file = writer.into_inner().map_err(|e| {
+            windows::core::Error::new(E_FAIL, format!("Final flush failed: {}", e))
+        })?;
 
-        // Write WAV file
-        let wav_format = WavFormat {
-            channels: n_channels,
-            sample_rate: n_samples_per_sec,
-            bits_per_sample: 16,
-            bytes_per_sec: n_samples_per_sec * n_channels as u32 * 2,
-            block_align: n_channels * 2,
-        };
+        // Fix RIFF chunk size at offset 4: total file size minus the 8-byte "RIFF????WAVE" prefix
+        let riff_size = (bytes_written + 36) as u32;
+        file.seek(SeekFrom::Start(4)).map_err(|e| {
+            windows::core::Error::new(E_FAIL, format!("Seek failed: {}", e))
+        })?;
+        file.write_all(&riff_size.to_le_bytes()).map_err(|e| {
+            windows::core::Error::new(E_FAIL, format!("Header fix failed: {}", e))
+        })?;
 
-        write_wav_file(output_file, &wav_format, &final_data).map_err(|e| {
-            windows::core::Error::new(E_FAIL, format!("Write failed: {}", e))
+        // Fix data chunk size at offset 40
+        file.seek(SeekFrom::Start(40)).map_err(|e| {
+            windows::core::Error::new(E_FAIL, format!("Seek failed: {}", e))
+        })?;
+        file.write_all(&(bytes_written as u32).to_le_bytes()).map_err(|e| {
+            windows::core::Error::new(E_FAIL, format!("Header fix failed: {}", e))
+        })?;
+
+        file.flush().map_err(|e| {
+            windows::core::Error::new(E_FAIL, format!("Final flush failed: {}", e))
         })?;
 
         Ok(())
